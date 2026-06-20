@@ -1,7 +1,8 @@
 # secure-repl
 
 A cost-effective, configurable **secure-REPL infrastructure** built on top of
-[`secure-exec`](https://github.com/umgbhalla/secure-exec). It runs untrusted,
+[`secure-exec`](https://github.com/umgbhalla/secure-exec). The same infra also
+lives in-repo at [`secure-exec/deploy/modal`](https://github.com/umgbhalla/secure-exec/tree/deploy/modal-infra/deploy/modal). It runs untrusted,
 agent-authored REPL code with:
 
 - **npm + CDN package support** — bundle any npm package (via esm.sh) or explicit
