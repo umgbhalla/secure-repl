@@ -1,0 +1,6 @@
+{
+  "name": "secure-repl-bundler",
+  "private": true,
+  "type": "module",
+  "dependencies": { "esbuild": "0.28.1" }
+}

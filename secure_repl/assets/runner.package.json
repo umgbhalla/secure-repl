@@ -1,0 +1,6 @@
+{
+  "name": "secure-repl-runner",
+  "private": true,
+  "type": "module",
+  "dependencies": { "secure-exec": "0.3.0" }
+}

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.modal.toml
+node_modules/
+*.log
+.DS_Store
