@@ -25,7 +25,7 @@ Scaling:
 Deploy:   modal deploy secure_repl/app.py
 Invoke:   see secure_repl/client.py / README.md
 
-Pinned: Modal SDK 1.3.x, node 22, esbuild 0.28.1, secure-exec 0.3.0.
+Pinned: Modal SDK 1.5.x, node 22, esbuild 0.28.1, secure-exec 0.3.0.
 """
 
 import hmac
@@ -141,6 +141,67 @@ def bundle(auth_token: str, entry: str, allow_hosts: list[str] | None = None) ->
         return {"ok": False, "error": f"bad bundler output: {proc.stdout[:500]}"}
 
 
+# Live channel layout (runner-local tiny files). Host<->guest goes over the
+# Sandbox filesystem API (sb.filesystem.write_text/read_text), which IS supported
+# under Modal's VM runtime as of SDK >=1.4 — no size cap, no compression, no argv
+# limit. (sb.reload_volumes() stays unsupported under the VM runtime, but reuse
+# does not need it: the request is written straight into the guest fs.)
+# Protocol: write REQ_JSON, then bump REQ_SEQ. The runner loop polls REQ_SEQ,
+# re-reads REQ_JSON, runs on the persistent NodeRuntime (NO microVM boot), and
+# writes RES_FILE + RES_SEQ. We then busy-wait (one exec) for the matching
+# RES_SEQ and read RES_FILE back over the filesystem API.
+_RUNNER_DIR = "/srv"
+_REQ_JSON = f"{_RUNNER_DIR}/req.json"   # request body; runner reads on each seq bump
+_REQ_SEQ = f"{_RUNNER_DIR}/req.seq"     # orchestrator bumps to signal a new request
+_RES_FILE = f"{_RUNNER_DIR}/res.json"   # result body; orchestrator reads it back
+_RES_SEQ = f"{_RUNNER_DIR}/res.seq"     # runner bumps to match REQ_SEQ when done
+
+# How long an already-booted sandbox may take to return a result before we give
+# up and rebuild. Generous — a single eval is sub-second once warm.
+_EXEC_WAIT_S = 90
+
+# Busy-wait shell: block until RES_SEQ equals the request token (or time out).
+# Just a barrier — the result body is read back over the filesystem API, so this
+# exec carries no payload.
+_WAIT_EXEC = (
+    'i=0; '
+    'while [ "$(cat {res_seq} 2>/dev/null)" != "$NSEQ" ]; do '
+    '  i=$((i+1)); [ "$i" -gt "$MAXI" ] && {{ echo "__TIMEOUT__"; exit 0; }}; '
+    '  sleep 0.005; '
+    'done; echo "__OK__"'
+).format(res_seq=_RES_SEQ)
+
+
+def _exec_status(sb, script: str, env: dict | None = None,
+                 timeout: int | None = None) -> str:
+    """Run a one-shot barrier command inside a live sandbox; return its stdout."""
+    p = sb.exec("bash", "-c", script, env=env or {}, timeout=timeout)
+    out = p.stdout.read()
+    p.wait()
+    return out
+
+
+def _serve_via_live_sandbox(sb, req: dict, wait_s: int) -> dict | None:
+    """Hand a fresh request to a running sandbox over the filesystem API and read
+    the result back. Returns the result dict, or None if it timed out / failed
+    (caller then rebuilds). No microVM boot on this path."""
+    import time as _t
+
+    sb.filesystem.write_text(json.dumps(req), _REQ_JSON)
+    next_seq = str(int(_t.time() * 1000))  # strictly-increasing token (> boot's 1)
+    sb.filesystem.write_text(next_seq, _REQ_SEQ)
+    maxi = int(wait_s / 0.005)
+    status = _exec_status(
+        sb, _WAIT_EXEC, env={"NSEQ": next_seq, "MAXI": str(maxi)}, timeout=wait_s + 10
+    ).strip()
+    if "__OK__" not in status:
+        return None
+    try:
+        return json.loads(sb.filesystem.read_text(_RES_FILE))
+    except (json.JSONDecodeError, Exception):
+        return None
+
+
 @app.function(
     image=runner_image,
     secrets=[auth_secret],
@@ -151,13 +212,24 @@ def bundle(auth_token: str, entry: str, allow_hosts: list[str] | None = None) ->
 )
 # One session per orchestrator container: Volume.commit() is process-global, so
 # in-process concurrency races on shared-mount writes (EPERM). Scale horizontally
-# by container instead (Modal spins up to max_containers). The orchestrator is
-# cheap — it just spawns a sandbox and waits — so a container apiece is fine.
-# ponytail: per-container isolation, revisit if orchestrator idle cost matters.
-def run_repl(auth_token: str, session_id: str, bundle_code: str, mode: str = "fresh") -> dict:
-    """Run a bundle inside a deny-net VM Sandbox with park/resume via Volume.
+# by container instead (Modal spins up to max_containers).
+#
+# PERSISTENT-SANDBOX REUSE: we keep the VM Sandbox (and its secure-exec
+# NodeRuntime) ALIVE across calls for the same (tenant, session). The live
+# sandbox's object_id is persisted on the Volume at <state_dir>/sandbox.id. On a
+# call we first try modal.Sandbox.from_id(stored_id); if it's still running we
+# hand it a fresh request over an in-sandbox file channel (write req.json, bump
+# req.seq, poll res.seq) — execute-only, NO microVM boot. If missing/dead we
+# create a fresh long-lived sandbox, run the bootstrap request, and store its id.
+def run_repl(auth_token: str, session_id: str, bundle_code: str, mode: str = "fresh",
+             persist: bool = False) -> dict:
+    """Run a bundle inside a deny-net VM Sandbox, reusing a live sandbox +
+    NodeRuntime per (tenant, session) when one exists.
 
-    `mode`: "fresh" (ignore prior state) | "resume" (rehydrate the session dir).
+    `mode`:    "fresh" (ignore prior state) | "resume" (rehydrate the session dir).
+    `persist`: snapshot guest state to the Volume after the run (durable park).
+               Forced on for resume. Off by default so a plain stateless eval
+               skips the extra snapshot rt.run() round-trip.
     Returns the runner contract dict (value, saved, rehydrated, ...).
     """
     try:
@@ -168,6 +240,37 @@ def run_repl(auth_token: str, session_id: str, bundle_code: str, mode: str = "fr
 
     import base64
 
+    # Namespace is derived from the validated tenant, NOT from client input.
+    state_dir = f"/vol/{tenant}/{session_id}"
+    in_path = f"{state_dir}/_input.json"   # bootstrap request (boot only)
+    out_path = f"{state_dir}/_result.json"
+    id_path = f"{state_dir}/sandbox.id"
+
+    persist = bool(persist) or mode == "resume"
+    req = {"bundle": bundle_code, "stateDir": state_dir, "mode": mode, "persist": persist}
+
+    # ---- Fast path: reuse a live sandbox for this session (execute-only). ----
+    state_volume.reload()
+    stored_id = None
+    if os.path.exists(id_path):
+        try:
+            with open(id_path) as f:
+                stored_id = f.read().strip() or None
+        except OSError:
+            stored_id = None
+
+    if stored_id:
+        try:
+            sb = modal.Sandbox.from_id(stored_id)
+            if sb.poll() is None:  # still running -> hand it a fresh request
+                result = _serve_via_live_sandbox(sb, req, _EXEC_WAIT_S)
+                if result is not None:
+                    return result  # served on the live runtime, NO microVM boot
+                # died / timed out / unreadable -> fall through and rebuild.
+        except Exception:
+            pass  # stale/invalid id -> create a fresh sandbox below.
+
+    # ---- Slow path: no live sandbox -> create a fresh long-lived one. --------
     # Sandbox image, built from the assets baked into THIS container (/srv).
     # Built at runtime (not module scope) because module-level local-file mounts
     # are re-read when Sandbox.create reloads the image — and the local source
@@ -185,16 +288,11 @@ def run_repl(auth_token: str, session_id: str, bundle_code: str, mode: str = "fr
         .run_commands(f"echo {_b64('/srv/runner.mjs')} | base64 -d > /srv/runner.mjs")
     )
 
-    # Namespace is derived from the validated tenant, NOT from client input.
-    state_dir = f"/vol/{tenant}/{session_id}"
-    in_path = f"{state_dir}/_input.json"
-    out_path = f"{state_dir}/_result.json"
-
-    # Stage input on the Volume (robust for large blobs; stdin to a VM Sandbox
-    # is unreliable). The runner reads INPUT_FILE and writes OUTPUT_FILE.
+    # Stage the bootstrap request on the Volume (the runner reads INPUT_FILE on
+    # boot and mirrors its result to OUTPUT_FILE and to the live RES channel).
     os.makedirs(state_dir, exist_ok=True)
     with open(in_path, "w") as f:
-        json.dump({"bundle": bundle_code, "stateDir": state_dir, "mode": mode}, f)
+        json.dump(req, f)
     state_volume.commit()
 
     sb = modal.Sandbox.create(
@@ -208,28 +306,54 @@ def run_repl(auth_token: str, session_id: str, bundle_code: str, mode: str = "fr
         timeout=RUNNER_TIMEOUT_S,
         volumes={"/vol": state_volume},
         experimental_options={"vm_runtime": True},  # real kernel for sidecar
-        env={"INPUT_FILE": in_path, "OUTPUT_FILE": out_path},
+        env={
+            "INPUT_FILE": in_path,    # bootstrap request payload (read at boot)
+            "OUTPUT_FILE": out_path,  # mirrored bootstrap result (durable)
+            # REQ_JSON defaults to /srv/req.json in the runner; reuse-path
+            # requests are written there directly via the filesystem API.
+            "RUNNER_DIR": _RUNNER_DIR,
+            "RUNNER_IDLE_MS": "60000",
+        },
     )
-    sb.wait()
-    out = sb.stdout.read()
-    err = sb.stderr.read()
-    sb.terminate()
 
-    # Prefer the Volume result file; fall back to stdout.
+    # Persist the live sandbox id so subsequent calls reuse it (execute-only).
+    try:
+        with open(id_path, "w") as f:
+            f.write(sb.object_id)
+        state_volume.commit()
+    except Exception:
+        pass
+
+    # The bootstrap request is served as RES_SEQ == 1. Wait for it (one blocking
+    # exec barrier) WITHOUT terminating the sandbox — we keep it alive for reuse.
+    # Boot includes image build (first time) + microVM start, so allow the full
+    # runner timeout, then read the result body over the filesystem API.
+    boot_maxi = int((RUNNER_TIMEOUT_S - 10) / 0.01)
+    boot_wait = (
+        'i=0; '
+        'while [ "$(cat {res_seq} 2>/dev/null)" != "1" ]; do '
+        '  i=$((i+1)); [ "$i" -gt "$MAXI" ] && {{ echo "__TIMEOUT__"; exit 0; }}; '
+        '  sleep 0.01; '
+        'done; echo "__OK__"'
+    ).format(res_seq=_RES_SEQ)
+    try:
+        status = _exec_status(
+            sb, boot_wait, env={"MAXI": str(boot_maxi)}, timeout=RUNNER_TIMEOUT_S
+        ).strip()
+        if "__OK__" in status:
+            return json.loads(sb.filesystem.read_text(_RES_FILE))
+    except Exception:
+        pass
+
+    # Fallback: read the Volume-mirrored bootstrap result.
     state_volume.reload()
-    result = None
     if os.path.exists(out_path):
         try:
             with open(out_path) as f:
-                result = json.load(f)
+                return json.load(f)
         except json.JSONDecodeError:
-            result = None
-    if result is None:
-        try:
-            result = json.loads(out.strip().splitlines()[-1])
-        except (json.JSONDecodeError, IndexError):
-            return {"ok": False, "error": f"no result. stdout: {out[:300]} | stderr: {err[-300:]}"}
-    return result
+            pass
+    return {"ok": False, "error": "no bootstrap result (runner did not emit seq 1)"}
 
 
 @app.local_entrypoint()

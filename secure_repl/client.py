@@ -30,13 +30,18 @@ class SecureRepl:
         return self._bundle.remote(self.api_key, code, allow_hosts)
 
     def eval(self, code: str, session: str = "default", resume: bool = False,
-             allow_hosts: list[str] | None = None) -> dict:
+             persist: bool = False, allow_hosts: list[str] | None = None) -> dict:
         """Bundle `code` then run it in a deny-net VM sandbox.
 
         `session` namespaces durable state within the caller's tenant. `resume=True`
-        rehydrates prior state before running.
+        rehydrates prior state before running. `persist=True` snapshots state to the
+        Volume after running (durable park); off by default for a faster stateless
+        eval. The live sandbox is reused per session regardless, so repeat calls to
+        the same session skip the microVM cold-start.
         """
         b = self.bundle(code, allow_hosts)
         if not b.get("ok"):
             return {"ok": False, "stage": "bundle", "error": b.get("error")}
-        return self._run.remote(self.api_key, session, b["code"], "resume" if resume else "fresh")
+        return self._run.remote(
+            self.api_key, session, b["code"], "resume" if resume else "fresh", persist
+        )
